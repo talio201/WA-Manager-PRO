@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+backend/node_modules/
+extension/node_modules/
+
+# Build artifacts
+dist/
+extension/dist/
+
+# Runtime data
+backend/uploads/
+backend/data/db.json
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example

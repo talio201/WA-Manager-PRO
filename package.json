@@ -1,0 +1,13 @@
+{
+  "scripts": {
+    "dev": "npm --prefix backend run dev",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:extension": "npm --prefix extension run dev",
+    "build:extension": "npm --prefix extension run build"
+  },
+  "dependencies": {
+    "@tailwindcss/postcss": "^4.1.18",
+    "autoprefixer": "^10.4.24",
+    "tailwindcss": "^4.1.18"
+  }
+}
