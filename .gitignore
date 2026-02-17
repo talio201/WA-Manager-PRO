@@ -18,3 +18,6 @@ backend/data/db.json
 backend/.env
 backend/.env.*
 !backend/.env.example
+
+extension/.git
+extension/.git_nested_backup
