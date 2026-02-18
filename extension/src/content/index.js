@@ -824,25 +824,58 @@ async function captureChatHistory(fallbackPhone = '', options = {}) {
 function clearEditable(target) {
   if (!target) return;
 
-  target.focus();
+  try {
+    target.focus();
+  } catch (error) {
+    // Ignore focus errors.
+  }
 
+  // Some WA fields are real inputs, others are contenteditable divs.
   if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
     target.value = '';
-    target.dispatchEvent(new Event('input', { bubbles: true }));
+    try {
+      target.dispatchEvent(new Event('input', { bubbles: true }));
+      target.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (error) {
+      // Best-effort only.
+    }
     return;
   }
 
-  document.execCommand('selectAll', false, null);
-  document.execCommand('delete', false, null);
+  // Prefer selecting node contents explicitly (more reliable than execCommand('selectAll')).
+  try {
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document.createRange();
+      range.selectNodeContents(target);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  } catch (error) {
+    // Ignore selection errors.
+  }
+
+  try {
+    // Replace the current selection with an empty string.
+    document.execCommand('insertText', false, '');
+  } catch (error) {
+    // Fallback below.
+  }
 
   if (target.isContentEditable) {
-    target.textContent = '';
-    target.innerHTML = '';
-    target.dispatchEvent(new InputEvent('input', {
-      bubbles: true,
-      inputType: 'deleteContentBackward',
-      data: '',
-    }));
+    try {
+      target.textContent = '';
+      target.innerHTML = '';
+    } catch (error) {
+      // Ignore direct DOM mutations errors.
+    }
+  }
+
+  try {
+    target.dispatchEvent(new Event('input', { bubbles: true }));
+    target.dispatchEvent(new Event('change', { bubbles: true }));
+  } catch (error) {
+    // Best-effort only.
   }
 }
 
@@ -860,6 +893,13 @@ function getTypingDelayMs(char, humanized) {
 
 async function typeInEditable(target, text, options = {}) {
   const humanized = options.humanized !== false;
+
+  // Validate if the target is visible and editable
+  if (!target || target.offsetParent === null || !target.isContentEditable) {
+    console.error('Target is not editable or not visible');
+    return;
+  }
+
   target.focus();
 
   for (let index = 0; index < text.length; index += 1) {
@@ -873,6 +913,15 @@ async function typeInEditable(target, text, options = {}) {
     }
 
     await sleep(delay);
+  }
+
+  // Confirm the text was inserted correctly
+  if (target.textContent.trim() !== text.trim()) {
+    console.warn('Text insertion validation failed. Retrying...');
+    clearEditable(target);
+    await sleep(200);
+    target.focus();
+    document.execCommand('insertText', false, text);
   }
 }
 
@@ -913,17 +962,33 @@ async function handleOpenChat(phone, searchTerms = []) {
 
   for (const term of termsToTry) {
     clearEditable(box);
-    await sleep(250);
+    await sleep(180);
+
+    if (String(box.textContent || '').trim()) {
+      // WA sometimes ignores the first clear attempt; retry once.
+      clearEditable(box);
+      await sleep(180);
+    }
 
     await typeInEditable(box, term, { humanized: true });
-    await sleep(1700);
+    await sleep(2000); // Increased wait time to ensure results load
 
     const firstResult = document.querySelector(`${SELECTORS.chatList} ${SELECTORS.chatItem}`);
     if (firstResult) {
       console.log(`Result found using term: ${term}. Clicking...`);
       firstResult.click();
       await sleep(1000);
-      return { success: true, searchTerm: term };
+
+      // Validate if the chat is open
+      const chatHeader = document.querySelector(SELECTORS.chatHeader);
+      if (chatHeader && chatHeader.textContent.includes(phone)) {
+        console.log('Chat opened successfully.');
+        return { success: true, searchTerm: term };
+      }
+
+      console.warn('Chat header validation failed. Retrying...');
+    } else {
+      console.warn(`No result found for term: ${term}. Retrying with next term.`);
     }
   }
 
@@ -1124,16 +1189,26 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
   const targetDigits = digitsOnly(targetPhone);
   const shouldHumanize = options.humanized !== false;
   const agentSearchTerms = Array.isArray(options.agentSearchTerms) ? options.agentSearchTerms : [];
+  const agentQuery = String(options.agentQuery || '').trim();
 
-  if (!agentDigits) {
-    return { success: false, error: 'Agent bridge phone is required.' };
+  const openAgentTerms = [
+    ...(agentQuery ? [agentQuery] : []),
+    ...agentSearchTerms,
+  ].filter(Boolean);
+
+  if (!agentDigits && openAgentTerms.length === 0) {
+    return { success: false, error: 'Agent bridge chat is required.' };
   }
 
   if (!targetDigits) {
     return { success: false, error: 'Target phone is required.' };
   }
 
-  const openAgentResult = await handleOpenChat(agentDigits, agentSearchTerms);
+  let openAgentResult = await handleOpenChat(agentDigits || '', openAgentTerms);
+  if (!openAgentResult?.success && agentQuery) {
+    // Some accounts don't match contacts by number; retry using chat query only.
+    openAgentResult = await handleOpenChat('', [agentQuery]);
+  }
   if (!openAgentResult?.success) {
     return {
       success: false,
@@ -1145,7 +1220,7 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
   await sleep(550);
 
   const bridgeMessage = `+${targetDigits}`;
-  const bridgeSendResult = await handleClickSend(bridgeMessage, { humanized: shouldHumanize });
+  const bridgeSendResult = await handleClickSend(bridgeMessage, { humanized: shouldHumanize, paste: true });
   if (!bridgeSendResult?.success) {
     return {
       success: false,
@@ -1195,13 +1270,20 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
 async function handleClickSend(message, options = {}) {
   console.log('Attempting to find Send button...');
   const shouldHumanize = options.humanized !== false;
+  const shouldPaste = Boolean(options.paste);
 
   if (message) {
     const msgBox = await getElement(SELECTORS.messageBox);
     if (msgBox) {
       msgBox.focus();
-      await typeInEditable(msgBox, message, { humanized: shouldHumanize });
-      await sleep(shouldHumanize ? (Math.random() * 700 + 300) : 500);
+      if (shouldPaste) {
+        // Insert everything at once (useful for bridge numbers).
+        document.execCommand('insertText', false, String(message));
+        await sleep(shouldHumanize ? (Math.random() * 240 + 180) : 120);
+      } else {
+        await typeInEditable(msgBox, message, { humanized: shouldHumanize });
+        await sleep(shouldHumanize ? (Math.random() * 700 + 300) : 500);
+      }
     } else {
       return { success: false, error: 'Message box not found' };
     }
@@ -1310,6 +1392,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     handleOpenChatViaAgentBridge(request.agentPhone, request.targetPhone, {
       humanized: request.humanized !== false,
       agentSearchTerms: request.agentSearchTerms || [],
+      agentQuery: request.agentQuery || '',
     }).then(sendResponse);
     return true;
   }

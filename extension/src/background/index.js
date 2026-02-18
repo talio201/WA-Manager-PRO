@@ -19,12 +19,17 @@ const DEFAULT_EXTENSION_SETTINGS = {
     softBlurOnIsland: true,
     manualPreSendDelayMs: 700,
     agentBridgePhone: '',
+    agentBridgeChatQuery: '',
 };
 
 let isRunning = false;
 let isProcessingQueue = false;
 let isManualSendInProgress = false;
 let nextRunTimeout = null;
+// Track current scheduled queue run to avoid competing schedulers (realtime vs anti-ban).
+let nextRunAt = null;
+let nextRunReason = null;
+let nextRunDelayMs = null;
 let activeCampaignId = null;
 let lastResolvedChat = null;
 let focusWhatsAppOnNextQueueRun = false;
@@ -64,6 +69,10 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (!alarm || alarm.name !== QUEUE_ALARM_NAME) return;
     if (!isRunning) return;
+    // Alarm has fired; allow schedule logic to create a fresh next run.
+    nextRunAt = null;
+    nextRunReason = null;
+    nextRunDelayMs = null;
     processQueue();
 });
 
@@ -85,6 +94,7 @@ function applySettings(raw = {}) {
         softBlurOnIsland: toBoolean(merged.softBlurOnIsland),
         manualPreSendDelayMs: Math.max(100, Math.min(2500, Number(merged.manualPreSendDelayMs) || 700)),
         agentBridgePhone: digitsOnly(merged.agentBridgePhone),
+        agentBridgeChatQuery: String(merged.agentBridgeChatQuery || '').trim(),
     };
 }
 
@@ -307,7 +317,7 @@ function startQueue(options = {}) {
     }
 
     if (!wasRunning || shouldForceImmediate || requestedCampaignId) {
-        scheduleNextRun(0);
+        scheduleNextRun(0, { reason: 'start', force: true });
     }
 
     broadcastRuntimeState();
@@ -349,25 +359,56 @@ function stopQueue() {
     clearQueueSchedule();
 }
 
-function scheduleNextRun(delayMs = IDLE_POLLING_INTERVAL_MS) {
+function scheduleNextRun(delayMs = IDLE_POLLING_INTERVAL_MS, meta = {}) {
     if (!isRunning) return;
 
     const safeDelayMs = Math.max(0, Number(delayMs) || 0);
+    const reason = String(meta?.reason || '').trim() || 'unknown';
+    const force = Boolean(meta?.force);
+
+    // If a next run is already scheduled earlier, keep it.
+    const now = Date.now();
+    const existingAt = Number(nextRunAt);
+    const hasExisting = Number.isFinite(existingAt) && existingAt > (now + 25);
+    const requestedAt = now + safeDelayMs;
+
+    if (hasExisting) {
+        if (requestedAt >= existingAt) {
+            return;
+        }
+
+        // Realtime events should only wake an idle queue. Never override anti-ban sleeps.
+        const existingReason = String(nextRunReason || '').trim() || 'unknown';
+        if (!force && reason === 'realtime_wake' && existingReason !== 'idle') {
+            return;
+        }
+    }
+
     clearQueueSchedule();
 
     try {
         const when = Date.now() + safeDelayMs;
+        const scheduledAt = Math.max(Date.now() + 50, when);
         chrome.alarms.create(QUEUE_ALARM_NAME, {
-            when: Math.max(Date.now() + 50, when),
+            when: scheduledAt,
         });
+        nextRunAt = scheduledAt;
+        nextRunReason = reason;
+        nextRunDelayMs = safeDelayMs;
         return;
     } catch (alarmError) {
         // Fallback for unexpected alarm API failures.
     }
 
     nextRunTimeout = setTimeout(() => {
+        nextRunAt = null;
+        nextRunReason = null;
+        nextRunDelayMs = null;
         processQueue();
     }, safeDelayMs);
+    nextRunAt = Date.now() + safeDelayMs;
+    nextRunReason = reason;
+    nextRunDelayMs = safeDelayMs;
 }
 
 function clearQueueSchedule() {
@@ -375,6 +416,9 @@ function clearQueueSchedule() {
         clearTimeout(nextRunTimeout);
         nextRunTimeout = null;
     }
+    nextRunAt = null;
+    nextRunReason = null;
+    nextRunDelayMs = null;
 
     try {
         chrome.alarms.clear(QUEUE_ALARM_NAME, () => {});
@@ -470,7 +514,7 @@ function handleRealtimeEnvelope(rawPayload) {
         if (!shouldWakeQueueByEvent(eventName)) return;
         if (isProcessingQueue || isManualSendInProgress) return;
 
-        scheduleNextRun(180);
+        scheduleNextRun(180, { reason: 'realtime_wake', eventName });
     } catch (error) {
         // Ignore malformed realtime payloads.
     }
@@ -694,10 +738,11 @@ async function openChatForCampaignJob(tab, job) {
     }
 
     const bridgePhone = digitsOnly(extensionSettings.agentBridgePhone);
-    if (!bridgePhone) {
+    const bridgeChatQuery = String(extensionSettings.agentBridgeChatQuery || '').trim();
+    if (!bridgePhone && !bridgeChatQuery) {
         return {
             success: false,
-            error: 'Configure o numero do agente (agent-id) nas configuracoes para enviar campanhas.',
+            error: 'Configure o chat do agente (bridge) nas configuracoes para enviar campanhas.',
         };
     }
 
@@ -711,12 +756,18 @@ async function openChatForCampaignJob(tab, job) {
     }
 
     try {
+        const agentSearchTerms = [
+            ...(bridgeChatQuery ? [bridgeChatQuery] : []),
+            ...(bridgePhone ? buildSearchTermsForPhone(bridgePhone) : []),
+        ];
+
         const bridgeResult = await sendMessageToTabWithRetry(tab.id, {
             action: 'OPEN_CHAT_VIA_AGENT_BRIDGE',
-            agentPhone: bridgePhone,
+            agentPhone: bridgePhone || '',
+            agentQuery: bridgeChatQuery || '',
             targetPhone,
             humanized: Boolean(extensionSettings.enableHumanizedTyping),
-            agentSearchTerms: buildSearchTermsForPhone(bridgePhone),
+            agentSearchTerms,
         }, 6, 500);
 
         if (bridgeResult?.success) {
@@ -1049,13 +1100,17 @@ async function processQueue() {
     if (!isRunning || isProcessingQueue) return;
 
     if (isManualSendInProgress) {
-        scheduleNextRun(1500);
+        scheduleNextRun(1500, { reason: 'manual_lock' });
         return;
     }
 
     isProcessingQueue = true;
     broadcastRuntimeState();
     let nextDelayMs = IDLE_POLLING_INTERVAL_MS;
+    let nextRunScheduleReason = 'idle';
+    // If we reserve a job but fail before updating its final status, we must requeue it
+    // to avoid leaving messages stuck in "processing" forever.
+    let reservedJob = null;
 
     try {
         const monitorTab = await findWhatsAppTab();
@@ -1065,11 +1120,13 @@ async function processQueue() {
 
         // 1. Get Next Job (stick to current campaign while it has pending jobs)
         let job = await fetchNextJob(activeCampaignId);
+        reservedJob = job;
 
         if (!job && activeCampaignId) {
             console.log(`No pending jobs for active campaign ${activeCampaignId}.`);
             activeCampaignId = null;
             job = await fetchNextJob();
+            reservedJob = job;
         }
 
         if (!job) {
@@ -1100,21 +1157,51 @@ async function processQueue() {
         // Only bridge flow via own agent chat (no direct link fallback).
         const navigation = await openChatForCampaignJob(tab, job);
         if (!navigation?.success) {
+            const navigationError = String(navigation?.error || '').trim();
+
             if (navigation?.transient) {
                 nextDelayMs = 4000;
+                nextRunScheduleReason = 'transient_wait';
+                // WhatsApp/content script still loading: release job back to the queue.
+                await updateJobStatus(job._id, 'pending');
+                reservedJob = null;
                 pushGlassToast({
                     title: 'Aguardando WhatsApp',
-                    message: navigation?.error || 'WhatsApp ainda inicializando.',
+                    message: navigationError || 'WhatsApp ainda inicializando.',
                     tone: 'warning',
                 });
                 return;
             }
 
-            await updateJobStatus(job._id, 'failed', navigation?.error || 'Falha ao abrir conversa da campanha.');
+            const isBridgeConfigurationIssue = (
+                navigationError.includes('Configure o chat do agente')
+                || navigationError.includes('Configure o numero do agente')
+                || navigationError.includes('Not found in contacts')
+                || navigationError.includes('Search box not found')
+            );
+
+            if (isBridgeConfigurationIssue) {
+                // This is not a per-message failure; pause the queue so the user can fix the bridge settings
+                // instead of marking the entire campaign as failed.
+                await updateJobStatus(job._id, 'pending');
+                reservedJob = null;
+                lastResolvedChat = null;
+
+                stopQueue();
+                pushGlassToast({
+                    title: 'Envio bloqueado',
+                    message: navigationError || 'Nao foi possivel abrir o chat do agente (bridge).',
+                    tone: 'error',
+                });
+                return;
+            }
+
+            await updateJobStatus(job._id, 'failed', navigationError || 'Falha ao abrir conversa da campanha.');
+            reservedJob = null;
             lastResolvedChat = null;
             pushGlassToast({
                 title: 'Falha no envio',
-                message: navigation?.error || 'Nao foi possivel abrir a conversa no WhatsApp.',
+                message: navigationError || 'Nao foi possivel abrir a conversa no WhatsApp.',
                 tone: 'error',
             });
             return;
@@ -1152,6 +1239,7 @@ async function processQueue() {
             const status = result && result.success ? 'sent' : 'failed';
             const errorMessage = result && result.error ? result.error : null;
             await updateJobStatus(job._id, status, errorMessage);
+            reservedJob = null;
 
             if (status === 'sent') {
                 recordOutboundSend();
@@ -1173,6 +1261,7 @@ async function processQueue() {
         } catch (error) {
             console.error('Error executing job in content script:', error);
             await updateJobStatus(job._id, 'failed', error.message);
+            reservedJob = null;
             lastResolvedChat = null;
             pushGlassToast({
                 title: 'Falha no envio',
@@ -1184,14 +1273,23 @@ async function processQueue() {
         // 6. Randomized anti-ban delay for next message + occasional long break.
         nextDelayMs = getRandomDelayMs(job.campaign);
         nextDelayMs = maybeApplyLongBreak(nextDelayMs);
+        nextRunScheduleReason = 'anti_ban';
         const nextDelaySeconds = Math.round(nextDelayMs / 1000);
         console.log(`Next message will be processed in ${nextDelaySeconds}s`);
     } catch (error) {
         console.error('Error in processQueue:', error);
+        if (reservedJob && reservedJob._id) {
+            // Best-effort requeue to avoid "processing" deadlocks.
+            try {
+                await updateJobStatus(reservedJob._id, 'pending');
+            } catch (requeueError) {
+                // Ignore secondary failures.
+            }
+        }
     } finally {
         isProcessingQueue = false;
         broadcastRuntimeState();
-        scheduleNextRun(nextDelayMs);
+        scheduleNextRun(nextDelayMs, { reason: nextRunScheduleReason });
     }
 }
 

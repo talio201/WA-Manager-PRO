@@ -1021,6 +1021,10 @@ exports.registerManualOutbound = async (req, res) => {
 exports.getNextJob = async (req, res) => {
     try {
         const requestedCampaignId = req.query.campaignId;
+        const configuredStaleTimeoutMs = Number(process.env.STALE_PROCESSING_TIMEOUT_MS);
+        const staleProcessingTimeoutMs = Number.isFinite(configuredStaleTimeoutMs) && configuredStaleTimeoutMs > 0
+            ? configuredStaleTimeoutMs
+            : 90 * 1000;
 
         // Step 1: Get active campaign IDs
         const activeCampaigns = await Campaign.find({ status: 'running' }).select('_id');
@@ -1040,6 +1044,53 @@ exports.getNextJob = async (req, res) => {
             eligibleCampaignIds = [requestedCampaignId];
         }
 
+        // Safety: if a worker crashes after reserving a job, it can get stuck forever in "processing".
+        // Requeue stale "processing" jobs back to "pending" so the system can recover automatically.
+        try {
+            const processingMessages = await Message.find({
+                status: 'processing',
+                campaign: { $in: eligibleCampaignIds },
+            });
+
+            const now = Date.now();
+            const staleCandidates = (Array.isArray(processingMessages) ? processingMessages : [])
+                .filter((item) => item && item._id)
+                .filter((item) => {
+                    const reference = item.lastAttemptAt || item.updatedAt || item.sentAt || item.createdAt || 0;
+                    const startedAt = new Date(reference).getTime();
+                    if (!Number.isFinite(startedAt) || startedAt <= 0) return false;
+                    return (now - startedAt) > staleProcessingTimeoutMs;
+                })
+                .slice(0, 25);
+
+            for (const candidate of staleCandidates) {
+                const stuck = await Message.findById(candidate._id);
+                if (!stuck || stuck.status !== 'processing') continue;
+
+                const previousStatus = stuck.status;
+                stuck.status = 'pending';
+                stuck.sentAt = null;
+                stuck.updatedAt = new Date();
+
+                appendAudit(stuck, 'stale_requeued', 'Message moved back to queue after processing timeout', {
+                    previousStatus,
+                    timeoutMs: staleProcessingTimeoutMs,
+                });
+
+                await stuck.save();
+                emitRealtimeEvent('messages.queue.requeued', {
+                    messageId: stuck._id,
+                    campaignId: stuck.campaign || null,
+                    phone: stuck.phone || '',
+                    previousStatus,
+                    status: stuck.status,
+                    updatedAt: stuck.updatedAt,
+                });
+            }
+        } catch (requeueError) {
+            // Best-effort only. If it fails, the queue still works for normal pending jobs.
+        }
+
         // Step 2: Reserve next pending job (FIFO)
         const job = await Message.findOneAndUpdate(
             {
@@ -1048,7 +1099,6 @@ exports.getNextJob = async (req, res) => {
             },
             {
                 status: 'processing',
-                sentAt: new Date(),
             },
             { sort: { _id: 1 }, new: true }
         ).populate('campaign', 'name antiBan media');

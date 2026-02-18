@@ -8,6 +8,7 @@ const DEFAULT_SETTINGS = {
     softBlurOnIsland: true,
     manualPreSendDelayMs: 700,
     agentBridgePhone: '',
+    agentBridgeChatQuery: '',
 };
 
 const storageKeys = Object.keys(DEFAULT_SETTINGS);
@@ -51,6 +52,13 @@ const Settings = () => {
         persistSettings({
             ...settings,
             agentBridgePhone: digits,
+        });
+    };
+
+    const updateAgentBridgeChatQuery = (value) => {
+        persistSettings({
+            ...settings,
+            agentBridgeChatQuery: String(value || ''),
         });
     };
 
@@ -130,9 +138,25 @@ const Settings = () => {
                 </section>
 
                 <section className="settings-input-card">
+                    <label htmlFor="agent-bridge-chat">
+                        <h3>Chat do agente (bridge)</h3>
+                        <p>Nome da conversa/contato usado como ponte (ex: Backup (você)).</p>
+                    </label>
+
+                    <input
+                        id="agent-bridge-chat"
+                        type="text"
+                        placeholder="Ex: Backup (você)"
+                        value={settings.agentBridgeChatQuery || ''}
+                        onChange={(event) => updateAgentBridgeChatQuery(event.target.value)}
+                        className="settings-glass-input"
+                    />
+                </section>
+
+                <section className="settings-input-card">
                     <label htmlFor="agent-bridge-phone">
                         <h3>Numero do agente (bridge)</h3>
-                        <p>Obrigatorio para envios. Use formato DDI+DDD+numero (somente digitos).</p>
+                        <p>Opcional. Se preferir, informe o numero em vez do nome do chat (somente digitos).</p>
                     </label>
 
                     <input
