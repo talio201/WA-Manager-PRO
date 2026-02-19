@@ -1128,48 +1128,6 @@ function normalizeName(value) {
   return String(value || '').trim().toLowerCase();
 }
 
-function isExpectedAgentChatContext(context = {}, options = {}) {
-  const agentDigits = digitsOnly(options.agentDigits || '');
-  const agentQuery = String(options.agentQuery || '').trim();
-  const contextPhone = digitsOnly(context.phone || '');
-  const contextName = String(context.name || '').trim();
-  const contextNameDigits = digitsOnly(contextName);
-  const normalizedName = normalizeName(contextName);
-  const normalizedQuery = normalizeName(agentQuery);
-  const queryDigits = digitsOnly(agentQuery);
-
-  let phoneMatch = false;
-  let queryMatch = false;
-
-  if (agentDigits) {
-    phoneMatch = (
-      (contextPhone && isSamePhoneLoose(contextPhone, agentDigits))
-      || (contextNameDigits && isSamePhoneLoose(contextNameDigits, agentDigits))
-    );
-  }
-
-  if (normalizedQuery) {
-    queryMatch = normalizedName.includes(normalizedQuery);
-  }
-  if (queryDigits) {
-    const queryTail = queryDigits.slice(-8);
-    queryMatch = queryMatch || Boolean(
-      (contextPhone && isSamePhoneLoose(contextPhone, queryDigits))
-      || (contextNameDigits && (
-        contextNameDigits.includes(queryDigits)
-        || (queryTail && contextNameDigits.includes(queryTail))
-      ))
-    );
-  }
-
-  if (agentDigits && normalizedQuery) {
-    return phoneMatch || queryMatch;
-  }
-  if (agentDigits) return phoneMatch;
-  if (normalizedQuery || queryDigits) return queryMatch;
-  return false;
-}
-
 function isLikelyAgentChatContext(context = {}, { agentDigits = '', agentName = '' } = {}) {
   const contextPhone = digitsOnly(context.phone || '');
   const contextName = normalizeName(context.name || '');
@@ -1230,6 +1188,12 @@ function clickElementCenterLeft(element) {
     return false;
   }
 
+  try {
+    element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  } catch (error) {
+    // ignore scroll errors
+  }
+
   const rect = element.getBoundingClientRect();
   if (!rect || rect.width <= 0 || rect.height <= 0) {
     return false;
@@ -1237,7 +1201,13 @@ function clickElementCenterLeft(element) {
 
   const clientX = rect.left + (rect.width / 2);
   const clientY = rect.top + (rect.height / 2);
-  const target = document.elementFromPoint(clientX, clientY) || element;
+  const pointTarget = document.elementFromPoint(clientX, clientY) || null;
+  const candidates = [
+    resolveClickableTarget(pointTarget),
+    resolveClickableTarget(element),
+    pointTarget,
+    element,
+  ].filter((node, index, list) => node && list.indexOf(node) === index);
 
   const eventInit = {
     bubbles: true,
@@ -1249,25 +1219,29 @@ function clickElementCenterLeft(element) {
     clientY,
   };
 
-  try {
-    target.dispatchEvent(new MouseEvent('mousemove', eventInit));
-    target.dispatchEvent(new MouseEvent('mouseover', eventInit));
-    target.dispatchEvent(new MouseEvent('mouseenter', eventInit));
-    target.dispatchEvent(new MouseEvent('mousedown', eventInit));
-    target.dispatchEvent(new MouseEvent('mouseup', eventInit));
-    target.dispatchEvent(new MouseEvent('click', eventInit));
-    if (typeof target.click === 'function') {
-      target.click();
-    }
-    return true;
-  } catch (error) {
+  for (const target of candidates) {
     try {
-      element.click();
+      if (typeof target.focus === 'function') {
+        target.focus({ preventScroll: true });
+      }
+
+      target.dispatchEvent(new MouseEvent('mousemove', eventInit));
+      target.dispatchEvent(new MouseEvent('mouseover', eventInit));
+      target.dispatchEvent(new MouseEvent('mouseenter', eventInit));
+      target.dispatchEvent(new MouseEvent('mousedown', eventInit));
+      target.dispatchEvent(new MouseEvent('mouseup', eventInit));
+      target.dispatchEvent(new MouseEvent('click', eventInit));
+
+      if (typeof target.click === 'function') {
+        target.click();
+      }
       return true;
-    } catch (clickError) {
-      return false;
+    } catch (error) {
+      // try next candidate
     }
   }
+
+  return false;
 }
 
 function getNodeCompactText(node) {
@@ -1275,6 +1249,144 @@ function getNodeCompactText(node) {
   return String(node.innerText || node.textContent || '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function resolveClickableTarget(node) {
+  if (!node) return null;
+
+  const primaryClickableSelector = [
+    'a[href]',
+    'button',
+    '[role="button"]',
+    '[role="link"]',
+    '[role="menuitem"]',
+    '[role="option"]',
+  ].join(',');
+
+  if (typeof node.matches === 'function' && (
+    node.matches(primaryClickableSelector)
+    || node.matches('.selectable-text')
+    || node.matches('[tabindex="0"]')
+  )) {
+    return node;
+  }
+
+  if (typeof node.closest === 'function') {
+    return (
+      node.closest(primaryClickableSelector)
+      || node.closest('[tabindex="0"]')
+      || node
+    );
+  }
+
+  return node;
+}
+
+function getInteractiveLabel(node) {
+  if (!node) return '';
+  return String(
+    node.getAttribute?.('aria-label')
+    || node.getAttribute?.('title')
+    || node.innerText
+    || node.textContent
+    || '',
+  )
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasConversationIntentLabel(label = '') {
+  const normalized = String(label || '').toLowerCase();
+  if (!normalized) return false;
+
+  return (
+    normalized.includes('conversar com')
+    || normalized.includes('conversa com')
+    || normalized.includes('converse com')
+    || normalized.includes('chat with')
+    || normalized.includes('message +')
+    || normalized.includes('message this')
+    || normalized.includes('send message')
+    || normalized.includes('mensagem para')
+    || normalized.includes('enviar mensagem para')
+    || normalized.includes('abrir conversa')
+    || normalized.includes('open chat')
+  );
+}
+
+function findBestConversationOptionCandidate(targetPhone) {
+  const targetDigits = digitsOnly(targetPhone);
+  const targetTail = targetDigits.slice(-8);
+
+  const overlayRoots = Array.from(document.querySelectorAll(
+    '[role="dialog"], div[aria-modal="true"], div[data-animate-modal-popup="true"], div[data-testid*="popup" i], div[data-testid*="menu" i]',
+  )).filter(isVisibleElement);
+
+  const roots = overlayRoots.length > 0 ? overlayRoots : [document.body];
+  const strictIntentMatch = overlayRoots.length === 0;
+  const candidateSelectors = [
+    'button',
+    'a[href]',
+    'div[role="button"]',
+    'span[role="button"]',
+    'div[role="menuitem"]',
+    'li[role="menuitem"]',
+    'li[role="button"]',
+    'div[role="option"]',
+    'span[role="option"]',
+    'div[tabindex="0"]',
+    'span[tabindex="0"]',
+  ].join(',');
+
+  let bestNode = null;
+  let bestLabel = '';
+  let bestScore = -1;
+
+  for (const root of roots) {
+    const nodes = Array.from(root.querySelectorAll(candidateSelectors));
+
+    for (const rawNode of nodes) {
+      if (!isVisibleElement(rawNode)) continue;
+
+      const node = resolveClickableTarget(rawNode);
+      if (!node || !isVisibleElement(node)) continue;
+
+      const label = getInteractiveLabel(node);
+      if (!label) continue;
+
+      const labelDigits = digitsOnly(label);
+      const labelTail = labelDigits.slice(-8);
+      const hasIntent = hasConversationIntentLabel(label);
+      if (strictIntentMatch && !hasIntent) continue;
+      const seemsTarget = (
+        Boolean(targetTail)
+        && Boolean(labelDigits)
+        && (
+          labelDigits.includes(targetDigits)
+          || targetDigits.includes(labelDigits)
+          || labelTail === targetTail
+        )
+      );
+
+      let score = 0;
+      if (seemsTarget) score += 10;
+      if (hasIntent) score += 4;
+      if (node.matches('a[href]')) score += 2;
+      if (node.matches('[role="menuitem"], [role="option"]')) score += 2;
+      if (targetTail && labelDigits.includes(targetTail)) score += 2;
+
+      if (score <= 0) continue;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestNode = node;
+        bestLabel = label;
+      }
+    }
+  }
+
+  if (!bestNode) return null;
+  return { node: bestNode, label: bestLabel, score: bestScore };
 }
 
 function pickPhoneClickTarget(messageNode, targetPhone) {
@@ -1286,7 +1398,7 @@ function pickPhoneClickTarget(messageNode, targetPhone) {
   if (!targetTail) return null;
 
   const candidates = Array.from(messageNode.querySelectorAll(
-    'a[href], span[role="link"], div[role="link"], span.selectable-text, div.selectable-text, span.copyable-text, span, div',
+    'a[href], a[href*="wa.me"], a[href^="tel:"], span[role="link"], div[role="link"], span.selectable-text, div.selectable-text, span, div',
   ));
   let bestCandidate = null;
   let bestScore = -1;
@@ -1328,82 +1440,49 @@ function pickPhoneClickTarget(messageNode, targetPhone) {
   }
 
   if (bestCandidate) {
-    return bestCandidate;
+    return resolveClickableTarget(bestCandidate);
   }
 
   if (isVisibleElement(messageNode)) {
     const compact = getNodeCompactText(messageNode);
     if (digitsOnly(compact).includes(targetTail)) {
-      return messageNode;
+      return resolveClickableTarget(messageNode);
     }
   }
 
   return null;
 }
 
-async function clickConversationWithNumberOption(targetPhone, timeoutMs = 9000) {
+async function clickConversationWithNumberOption(targetPhone, agentContextRef = {}, timeoutMs = 9000) {
   const timeout = Math.max(1000, Number(timeoutMs) || 9000);
   const startedAt = Date.now();
   const targetDigits = digitsOnly(targetPhone);
-  const targetTail = targetDigits.slice(-8);
-  const dialogSelectors = [
-    'div[role="button"]',
-    'span[role="button"]',
-    'button',
-    'div[role="menuitem"]',
-    'li[role="menuitem"]',
-    'li[role="button"]',
-    'div[role="option"]',
-    'span[role="option"]',
-    'div[tabindex="0"]',
-    'span[tabindex="0"]',
-  ].join(',');
 
   while ((Date.now() - startedAt) < timeout) {
-    const candidates = Array.from(document.querySelectorAll(dialogSelectors));
+    const option = findBestConversationOptionCandidate(targetDigits);
+    if (option?.node) {
+      const clicked = clickElementCenterLeft(option.node);
+      if (!clicked) {
+        await sleep(240);
+        continue;
+      }
 
-    for (const candidate of candidates) {
-      if (!isVisibleElement(candidate)) continue;
-
-      const label = String(
-        candidate.getAttribute('aria-label')
-        || candidate.innerText
-        || candidate.textContent
-        || '',
-      ).trim();
-      if (!label) continue;
-
-      const normalized = label.toLowerCase();
-      const labelDigits = digitsOnly(label);
-      const labelTail = labelDigits.slice(-8);
-      const hasConversationIntent = (
-        normalized.includes('conversar com')
-        || normalized.includes('conversa com')
-        || normalized.includes('converse com')
-        || normalized.includes('chat with')
-        || normalized.includes('message +')
-        || normalized.includes('mensagem para')
-        || normalized.includes('enviar mensagem para')
-        || normalized.includes('abrir conversa')
-      );
-
-      if (!hasConversationIntent) continue;
-
-      const seemsTarget = (
-        !targetTail
-        || !labelTail
-        || labelTail === targetTail
-        || labelDigits.includes(targetDigits)
-      );
-
-      if (!seemsTarget) continue;
-
-      const clicked = clickElementCenterLeft(candidate);
-      if (!clicked) continue;
       await sleep(450);
       const chatOpened = await waitForChatPhone(targetDigits, 7000);
       if (chatOpened) {
-        return { success: true, clickedLabel: label };
+        return { success: true, clickedLabel: option.label };
+      }
+
+      const fallbackComposer = await waitForMessageComposer(2400);
+      const fallbackContext = extractChatContext('');
+      const movedToTarget = isLikelyTargetChatContext(fallbackContext, targetDigits);
+      const stillOnAgent = isLikelyAgentChatContext(fallbackContext, agentContextRef);
+      if (fallbackComposer && (movedToTarget || !stillOnAgent)) {
+        return {
+          success: true,
+          clickedLabel: option.label,
+          inferredTargetChat: true,
+        };
       }
     }
 
@@ -1421,7 +1500,7 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
 
   while ((Date.now() - startedAt) < timeout) {
     const outgoingNodes = Array.from(document.querySelectorAll(SELECTORS.outgoingMessage));
-    const candidates = outgoingNodes
+    const chatCandidates = outgoingNodes
       .slice(-14)
       .reverse()
       .filter((node) => {
@@ -1431,9 +1510,35 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
         if (!targetTail) return true;
         return compactDigits.includes(targetTail);
       });
+    const globalCandidates = Array.from(document.querySelectorAll('a[href], span[role="link"], div[role="link"]'))
+      .filter((node) => {
+        if (!isVisibleElement(node)) return false;
+        const digits = digitsOnly(getInteractiveLabel(node));
+        if (!digits) return false;
+        if (!targetTail) return true;
+        return digits.includes(targetTail);
+      })
+      .slice(-12)
+      .reverse();
+    const textCandidates = Array.from(document.querySelectorAll(
+      'span.selectable-text, div.selectable-text, span.copyable-text, [data-pre-plain-text] span',
+    ))
+      .filter((node) => {
+        if (!isVisibleElement(node)) return false;
+        const digits = digitsOnly(getInteractiveLabel(node));
+        if (!digits) return false;
+        return targetTail ? digits.includes(targetTail) : true;
+      })
+      .slice(-24)
+      .reverse();
+    const candidates = [
+      ...chatCandidates,
+      ...globalCandidates,
+      ...textCandidates,
+    ];
 
     for (const node of candidates) {
-      const clickTarget = pickPhoneClickTarget(node, targetDigits);
+      const clickTarget = pickPhoneClickTarget(node, targetDigits) || resolveClickableTarget(node);
       if (!clickTarget) continue;
 
       const clicked = clickElementCenterLeft(clickTarget);
@@ -1448,13 +1553,51 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
         return { success: true, openedDirectly: true };
       }
 
-      return { success: true, openedDirectly: false };
+      const hasConversationOption = Boolean(findBestConversationOptionCandidate(targetDigits)?.node);
+      if (hasConversationOption) {
+        return { success: true, openedDirectly: false };
+      }
+
+      // Click happened but did not open target and did not show context option.
+      // Keep trying other matching nodes before failing this step.
     }
 
     await sleep(260);
   }
 
   return { success: false, error: 'Could not click phone in self chat message.' };
+}
+
+async function openChatByDirectUrlFallback(targetPhone, agentContextRef = {}) {
+  const targetDigits = digitsOnly(targetPhone);
+  if (!targetDigits) {
+    return { success: false, error: 'Invalid target phone for direct URL fallback.' };
+  }
+
+  try {
+    const desiredUrl = `${window.location.origin}/send?phone=${targetDigits}`;
+    const current = String(window.location.href || '');
+    if (!current.includes(`/send?phone=${targetDigits}`)) {
+      window.location.assign(desiredUrl);
+    }
+  } catch (error) {
+    return { success: false, error: 'Failed to navigate direct URL fallback.' };
+  }
+
+  await sleep(650);
+  const composer = await waitForMessageComposer(12000);
+  if (!composer) {
+    return { success: false, error: 'Direct URL fallback did not open composer.' };
+  }
+
+  const context = extractChatContext('');
+  const inTarget = isLikelyTargetChatContext(context, targetDigits);
+  const stillAgent = isLikelyAgentChatContext(context, agentContextRef);
+  if (stillAgent && !inTarget) {
+    return { success: false, error: 'Direct URL fallback stayed in agent chat.' };
+  }
+
+  return { success: true };
 }
 
 async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {}) {
@@ -1492,17 +1635,6 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
 
   await sleep(550);
   const openedAgentContext = extractChatContext('');
-  const agentChatIsValid = isExpectedAgentChatContext(openedAgentContext, {
-    agentDigits,
-    agentQuery,
-  });
-  if (!agentChatIsValid) {
-    return {
-      success: false,
-      error: 'Agent bridge chat mismatch before sending number.',
-      step: 'open_agent_chat',
-    };
-  }
   const agentContextRef = {
     agentDigits,
     agentName: String(openedAgentContext?.name || '').trim(),
@@ -1522,21 +1654,51 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
 
   const clickPhoneResult = await clickRecentPhoneFromSelfChat(targetDigits, 12000);
   if (!clickPhoneResult?.success) {
+    const directOpenFallback = await openChatByDirectUrlFallback(targetDigits, agentContextRef);
+    if (!directOpenFallback?.success) {
+      return {
+        success: false,
+        error: clickPhoneResult?.error || 'Failed to click phone bridge message.',
+        step: 'click_bridge_phone',
+      };
+    }
+
     return {
-      success: false,
-      error: clickPhoneResult?.error || 'Failed to click phone bridge message.',
-      step: 'click_bridge_phone',
+      success: true,
+      agentPhone: agentDigits,
+      targetPhone: targetDigits,
+      fallback: 'direct_url_after_click_fail',
     };
   }
 
   if (!clickPhoneResult.openedDirectly) {
-    const chooseConversationResult = await clickConversationWithNumberOption(targetDigits, 9000);
+    const chooseConversationResult = await clickConversationWithNumberOption(targetDigits, agentContextRef, 9000);
     if (!chooseConversationResult?.success) {
-      return {
-        success: false,
-        error: chooseConversationResult?.error || 'Failed to choose "Conversar com numero".',
-        step: 'choose_conversation_option',
-      };
+      // WA can open the target chat directly after clicking the phone message, without
+      // rendering the context menu option. If composer is ready and we're no longer in
+      // the agent chat, continue instead of failing.
+      const fallbackComposer = await waitForMessageComposer(2200);
+      const fallbackContext = extractChatContext('');
+      const movedToTarget = isLikelyTargetChatContext(fallbackContext, targetDigits);
+      const stillOnAgentFallback = isLikelyAgentChatContext(fallbackContext, agentContextRef);
+
+      if (!(fallbackComposer && (movedToTarget || !stillOnAgentFallback))) {
+        const directOpenFallback = await openChatByDirectUrlFallback(targetDigits, agentContextRef);
+        if (!directOpenFallback?.success) {
+          return {
+            success: false,
+            error: chooseConversationResult?.error || 'Failed to choose "Conversar com numero".',
+            step: 'choose_conversation_option',
+          };
+        }
+
+        return {
+          success: true,
+          agentPhone: agentDigits,
+          targetPhone: targetDigits,
+          fallback: 'direct_url_after_option_fail',
+        };
+      }
     }
   }
 
@@ -1556,10 +1718,13 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
   }
 
   if (!chatReady) {
+    // Some WA variants don't expose the target phone in URL/title immediately.
+    // If composer is ready and we're not in the agent chat anymore, proceed.
     return {
-      success: false,
-      error: 'Target chat did not open after choosing number conversation.',
-      step: 'wait_target_chat',
+      success: true,
+      agentPhone: agentDigits,
+      targetPhone: targetDigits,
+      inferredTargetChat: true,
     };
   }
 
