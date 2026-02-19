@@ -1188,6 +1188,12 @@ function clickElementCenterLeft(element) {
     return false;
   }
 
+  try {
+    element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  } catch (error) {
+    // ignore scroll errors
+  }
+
   const rect = element.getBoundingClientRect();
   if (!rect || rect.width <= 0 || rect.height <= 0) {
     return false;
@@ -1195,7 +1201,13 @@ function clickElementCenterLeft(element) {
 
   const clientX = rect.left + (rect.width / 2);
   const clientY = rect.top + (rect.height / 2);
-  const target = document.elementFromPoint(clientX, clientY) || element;
+  const pointTarget = document.elementFromPoint(clientX, clientY) || null;
+  const candidates = [
+    resolveClickableTarget(pointTarget),
+    resolveClickableTarget(element),
+    pointTarget,
+    element,
+  ].filter((node, index, list) => node && list.indexOf(node) === index);
 
   const eventInit = {
     bubbles: true,
@@ -1207,22 +1219,29 @@ function clickElementCenterLeft(element) {
     clientY,
   };
 
-  try {
-    target.dispatchEvent(new MouseEvent('mousemove', eventInit));
-    target.dispatchEvent(new MouseEvent('mouseover', eventInit));
-    target.dispatchEvent(new MouseEvent('mouseenter', eventInit));
-    target.dispatchEvent(new MouseEvent('mousedown', eventInit));
-    target.dispatchEvent(new MouseEvent('mouseup', eventInit));
-    target.dispatchEvent(new MouseEvent('click', eventInit));
-    return true;
-  } catch (error) {
+  for (const target of candidates) {
     try {
-      element.click();
+      if (typeof target.focus === 'function') {
+        target.focus({ preventScroll: true });
+      }
+
+      target.dispatchEvent(new MouseEvent('mousemove', eventInit));
+      target.dispatchEvent(new MouseEvent('mouseover', eventInit));
+      target.dispatchEvent(new MouseEvent('mouseenter', eventInit));
+      target.dispatchEvent(new MouseEvent('mousedown', eventInit));
+      target.dispatchEvent(new MouseEvent('mouseup', eventInit));
+      target.dispatchEvent(new MouseEvent('click', eventInit));
+
+      if (typeof target.click === 'function') {
+        target.click();
+      }
       return true;
-    } catch (clickError) {
-      return false;
+    } catch (error) {
+      // try next candidate
     }
   }
+
+  return false;
 }
 
 function getNodeCompactText(node) {
@@ -1501,9 +1520,21 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
       })
       .slice(-12)
       .reverse();
+    const textCandidates = Array.from(document.querySelectorAll(
+      'span.selectable-text, div.selectable-text, span.copyable-text, [data-pre-plain-text] span',
+    ))
+      .filter((node) => {
+        if (!isVisibleElement(node)) return false;
+        const digits = digitsOnly(getInteractiveLabel(node));
+        if (!digits) return false;
+        return targetTail ? digits.includes(targetTail) : true;
+      })
+      .slice(-24)
+      .reverse();
     const candidates = [
       ...chatCandidates,
       ...globalCandidates,
+      ...textCandidates,
     ];
 
     for (const node of candidates) {
@@ -1522,13 +1553,51 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
         return { success: true, openedDirectly: true };
       }
 
-      return { success: true, openedDirectly: false };
+      const hasConversationOption = Boolean(findBestConversationOptionCandidate(targetDigits)?.node);
+      if (hasConversationOption) {
+        return { success: true, openedDirectly: false };
+      }
+
+      // Click happened but did not open target and did not show context option.
+      // Keep trying other matching nodes before failing this step.
     }
 
     await sleep(260);
   }
 
   return { success: false, error: 'Could not click phone in self chat message.' };
+}
+
+async function openChatByDirectUrlFallback(targetPhone, agentContextRef = {}) {
+  const targetDigits = digitsOnly(targetPhone);
+  if (!targetDigits) {
+    return { success: false, error: 'Invalid target phone for direct URL fallback.' };
+  }
+
+  try {
+    const desiredUrl = `${window.location.origin}/send?phone=${targetDigits}`;
+    const current = String(window.location.href || '');
+    if (!current.includes(`/send?phone=${targetDigits}`)) {
+      window.location.assign(desiredUrl);
+    }
+  } catch (error) {
+    return { success: false, error: 'Failed to navigate direct URL fallback.' };
+  }
+
+  await sleep(650);
+  const composer = await waitForMessageComposer(12000);
+  if (!composer) {
+    return { success: false, error: 'Direct URL fallback did not open composer.' };
+  }
+
+  const context = extractChatContext('');
+  const inTarget = isLikelyTargetChatContext(context, targetDigits);
+  const stillAgent = isLikelyAgentChatContext(context, agentContextRef);
+  if (stillAgent && !inTarget) {
+    return { success: false, error: 'Direct URL fallback stayed in agent chat.' };
+  }
+
+  return { success: true };
 }
 
 async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {}) {
@@ -1585,10 +1654,20 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
 
   const clickPhoneResult = await clickRecentPhoneFromSelfChat(targetDigits, 12000);
   if (!clickPhoneResult?.success) {
+    const directOpenFallback = await openChatByDirectUrlFallback(targetDigits, agentContextRef);
+    if (!directOpenFallback?.success) {
+      return {
+        success: false,
+        error: clickPhoneResult?.error || 'Failed to click phone bridge message.',
+        step: 'click_bridge_phone',
+      };
+    }
+
     return {
-      success: false,
-      error: clickPhoneResult?.error || 'Failed to click phone bridge message.',
-      step: 'click_bridge_phone',
+      success: true,
+      agentPhone: agentDigits,
+      targetPhone: targetDigits,
+      fallback: 'direct_url_after_click_fail',
     };
   }
 
@@ -1604,10 +1683,20 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
       const stillOnAgentFallback = isLikelyAgentChatContext(fallbackContext, agentContextRef);
 
       if (!(fallbackComposer && (movedToTarget || !stillOnAgentFallback))) {
+        const directOpenFallback = await openChatByDirectUrlFallback(targetDigits, agentContextRef);
+        if (!directOpenFallback?.success) {
+          return {
+            success: false,
+            error: chooseConversationResult?.error || 'Failed to choose "Conversar com numero".',
+            step: 'choose_conversation_option',
+          };
+        }
+
         return {
-          success: false,
-          error: chooseConversationResult?.error || 'Failed to choose "Conversar com numero".',
-          step: 'choose_conversation_option',
+          success: true,
+          agentPhone: agentDigits,
+          targetPhone: targetDigits,
+          fallback: 'direct_url_after_option_fail',
         };
       }
     }
