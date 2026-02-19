@@ -1235,23 +1235,29 @@ function getNodeCompactText(node) {
 function resolveClickableTarget(node) {
   if (!node) return null;
 
-  const clickableSelector = [
+  const primaryClickableSelector = [
     'a[href]',
     'button',
     '[role="button"]',
     '[role="link"]',
     '[role="menuitem"]',
     '[role="option"]',
-    '[tabindex="0"]',
-    '[tabindex="-1"]',
   ].join(',');
 
-  if (typeof node.matches === 'function' && node.matches(clickableSelector)) {
+  if (typeof node.matches === 'function' && (
+    node.matches(primaryClickableSelector)
+    || node.matches('.selectable-text')
+    || node.matches('[tabindex="0"]')
+  )) {
     return node;
   }
 
   if (typeof node.closest === 'function') {
-    return node.closest(clickableSelector) || node;
+    return (
+      node.closest(primaryClickableSelector)
+      || node.closest('[tabindex="0"]')
+      || node
+    );
   }
 
   return node;
@@ -1472,7 +1478,6 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
   const startedAt = Date.now();
   const targetDigits = digitsOnly(targetPhone);
   const targetTail = targetDigits.slice(-8);
-  const attemptedNodes = new WeakSet();
 
   while ((Date.now() - startedAt) < timeout) {
     const outgoingNodes = Array.from(document.querySelectorAll(SELECTORS.outgoingMessage));
@@ -1504,8 +1509,6 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
     for (const node of candidates) {
       const clickTarget = pickPhoneClickTarget(node, targetDigits) || resolveClickableTarget(node);
       if (!clickTarget) continue;
-      if (attemptedNodes.has(clickTarget)) continue;
-      attemptedNodes.add(clickTarget);
 
       const clicked = clickElementCenterLeft(clickTarget);
       if (!clicked) {
@@ -1519,10 +1522,7 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
         return { success: true, openedDirectly: true };
       }
 
-      const hasConversationOption = Boolean(findBestConversationOptionCandidate(targetDigits)?.node);
-      if (hasConversationOption) {
-        return { success: true, openedDirectly: false };
-      }
+      return { success: true, openedDirectly: false };
     }
 
     await sleep(260);
