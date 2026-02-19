@@ -1196,7 +1196,7 @@ async function processQueue() {
             const navigationError = String(navigation?.error || '').trim();
             const normalizedNavigationError = navigationError.toLowerCase();
             const attemptCount = Math.max(1, Number(job?.attemptCount) || 1);
-            const maxBridgeRetries = 3;
+            const maxBridgeRetries = 1;
 
             const isBridgeConfigurationIssue = (
                 normalizedNavigationError.includes('configure o chat do agente')
@@ -1305,7 +1305,7 @@ async function processQueue() {
             const status = result && result.success ? 'sent' : 'failed';
             const errorMessage = result && result.error ? result.error : null;
             const attemptCount = Math.max(1, Number(job?.attemptCount) || 1);
-            const maxSendRetries = 3;
+            const maxSendRetries = 1;
 
             const normalizedSendError = String(errorMessage || '').toLowerCase();
             const isTransientSendError = (
