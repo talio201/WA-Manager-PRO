@@ -8,9 +8,10 @@ exports.uploadFile = (req, res) => {
         }
 
         // Return the URL to access the file
-        // Assuming server runs on localhost:5000 for now. 
-        // In production, this should use an env var for BASE_URL.
-        const baseUrl = process.env.BASE_URL || 'http://localhost:5000';
+        // Prefer the request host so URLs keep working when PORT changes.
+        // BASE_URL can still override this in production/reverse-proxy setups.
+        const baseUrl = String(process.env.BASE_URL || '').trim()
+            || `${req.protocol}://${req.get('host')}`;
         const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
 
         res.json({

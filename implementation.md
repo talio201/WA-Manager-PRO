@@ -14,7 +14,7 @@ Estado atual (implementado)
 - Fluxo de atendimento compartilhado por atribuicao de conversa por telefone.
 
 2) Realtime e webhooks
-- WebSocket no backend em `ws://localhost:5000/ws`.
+- WebSocket no backend em `ws://localhost:3000/ws`.
 - Eventos emitidos para campanhas, mensagens, atribuicoes, upload e IA.
 - Webhooks de saida configuraveis por `WEBHOOK_TARGETS` (lista separada por virgula).
 - Assinatura opcional HMAC SHA-256 por `WEBHOOK_SECRET` em header `X-WA-Signature`.

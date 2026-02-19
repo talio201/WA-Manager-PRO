@@ -34,7 +34,7 @@ O backend precisa estar rodando para a extensão funcionar.
     ```bash
     npm run dev
     ```
-    *O servidor rodará em `http://localhost:5000`.*
+    *O servidor rodará em `http://localhost:3000` (se você usar a porta 5000 e receber 403, é porque ela pode estar ocupada pelo macOS).*
 
 ### 2. Instalar a Extensão
 1.  Abra o terminal na pasta `extension`.

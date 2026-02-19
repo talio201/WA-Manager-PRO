@@ -1,10 +1,10 @@
 ﻿console.log('WA Campaign Manager: Content Script Loaded');
 
 const SELECTORS = {
-  sendButton: 'span[data-icon="send"], button[aria-label="Send"], button[aria-label="Enviar"]',
-  messageBox: 'div[title="Type a message"], div[title="Digite uma mensagem"], div[contenteditable="true"][data-tab="10"]',
+  sendButton: 'span[data-icon="send"], span[data-icon="send-filled"], button[aria-label*="Send" i], button[aria-label*="Enviar" i], div[role="button"][aria-label*="Send" i], div[role="button"][aria-label*="Enviar" i]',
+  messageBox: 'footer div[contenteditable="true"][data-tab], footer div[role="textbox"][contenteditable="true"], div[title="Type a message"], div[title="Digite uma mensagem"], div[aria-label*="Type a message" i][contenteditable="true"], div[aria-label*="Digite uma mensagem" i][contenteditable="true"], div[contenteditable="true"][data-tab="10"]',
   // Search selectors can vary between WA builds
-  searchBox: 'div[contenteditable="true"][data-tab="3"], div[contenteditable="true"][data-tab="11"]',
+  searchBox: 'div[contenteditable="true"][data-tab="3"], div[contenteditable="true"][data-tab="11"], div[role="textbox"][contenteditable="true"][data-tab], div[aria-label*="Search" i][contenteditable="true"], div[aria-label*="Pesquisar" i][contenteditable="true"]',
   invalidNumber: 'div[data-animate-modal-popup="true"]',
   chatList: 'div[aria-label="Chat list"]',
   chatItem: 'div[role="listitem"]',
@@ -560,9 +560,11 @@ function buildSearchTerms(phone, providedTerms = []) {
 }
 
 function extractChatContext(fallbackPhone = '') {
+  const fallbackDigits = digitsOnly(fallbackPhone);
   const context = {
-    phone: digitsOnly(fallbackPhone),
+    phone: '',
     name: '',
+    phoneSource: 'unknown', // url | title | fallback | unknown
   };
 
   try {
@@ -570,6 +572,7 @@ function extractChatContext(fallbackPhone = '') {
     const urlPhone = digitsOnly(currentUrl.searchParams.get('phone'));
     if (urlPhone) {
       context.phone = urlPhone;
+      context.phoneSource = 'url';
     }
   } catch (error) {
     // Ignore URL parsing issues.
@@ -582,7 +585,13 @@ function extractChatContext(fallbackPhone = '') {
     const titleDigits = digitsOnly(titleText);
     if (!context.phone && titleDigits.length >= 8) {
       context.phone = titleDigits;
+      context.phoneSource = 'title';
     }
+  }
+
+  if (!context.phone && fallbackDigits) {
+    context.phone = fallbackDigits;
+    context.phoneSource = 'fallback';
   }
 
   return context;
@@ -891,13 +900,20 @@ function getTypingDelayMs(char, humanized) {
   return Math.random() * 95 + 35;
 }
 
+function normalizeEditableText(value) {
+  return String(value || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function typeInEditable(target, text, options = {}) {
   const humanized = options.humanized !== false;
 
   // Validate if the target is visible and editable
   if (!target || target.offsetParent === null || !target.isContentEditable) {
     console.error('Target is not editable or not visible');
-    return;
+    return { success: false, error: 'Target is not editable or not visible' };
   }
 
   target.focus();
@@ -915,14 +931,26 @@ async function typeInEditable(target, text, options = {}) {
     await sleep(delay);
   }
 
-  // Confirm the text was inserted correctly
-  if (target.textContent.trim() !== text.trim()) {
+  const expectedText = normalizeEditableText(text);
+  let currentText = normalizeEditableText(target.textContent);
+
+  // Confirm the text was inserted correctly (normalized).
+  if (currentText !== expectedText) {
     console.warn('Text insertion validation failed. Retrying...');
     clearEditable(target);
     await sleep(200);
     target.focus();
     document.execCommand('insertText', false, text);
+    // Retry once and re-check.
+    await sleep(120);
+    currentText = normalizeEditableText(target.textContent);
+    if (currentText !== expectedText) {
+      console.error('Text insertion failed after retry. Aborting further attempts.');
+      return { success: false, error: 'Text insertion failed after retry' };
+    }
   }
+
+  return { success: true };
 }
 
 function getElement(selector, timeout = 5000) {
@@ -946,6 +974,30 @@ function getElement(selector, timeout = 5000) {
   });
 }
 
+async function waitForMessageComposer(timeoutMs = 12000) {
+  const startedAt = Date.now();
+  const timeout = Math.max(1000, Number(timeoutMs) || 12000);
+
+  while ((Date.now() - startedAt) < timeout) {
+    const footerCandidates = Array.from(
+      document.querySelectorAll('footer div[contenteditable="true"], footer [role="textbox"][contenteditable="true"]'),
+    ).filter((element) => isVisibleElement(element) && element.isContentEditable);
+
+    if (footerCandidates.length > 0) {
+      return footerCandidates[0];
+    }
+
+    const candidate = document.querySelector(SELECTORS.messageBox);
+    if (candidate && isVisibleElement(candidate) && candidate.isContentEditable) {
+      return candidate;
+    }
+
+    await sleep(220);
+  }
+
+  return null;
+}
+
 async function handleOpenChat(phone, searchTerms = []) {
   console.log('Attempting to open chat via DOM search:', phone);
 
@@ -955,46 +1007,97 @@ async function handleOpenChat(phone, searchTerms = []) {
     return { success: false, error: 'Search box not found' };
   }
 
-  const termsToTry = buildSearchTerms(phone, searchTerms);
-  if (termsToTry.length === 0) {
-    return { success: false, error: 'No search terms available' };
+  // Usar apenas um termo: nome OU telefone (nunca ambos)
+  let term = '';
+  if (searchTerms && searchTerms.length > 0) {
+    term = String(searchTerms[0] || '').trim();
+  } else if (phone) {
+    term = String(phone).trim();
+  }
+  if (!term) {
+    return { success: false, error: 'No search term available' };
   }
 
-  for (const term of termsToTry) {
-    clearEditable(box);
-    await sleep(180);
-
-    if (String(box.textContent || '').trim()) {
-      // WA sometimes ignores the first clear attempt; retry once.
-      clearEditable(box);
-      await sleep(180);
-    }
-
-    await typeInEditable(box, term, { humanized: true });
-    await sleep(2000); // Increased wait time to ensure results load
-
-    const firstResult = document.querySelector(`${SELECTORS.chatList} ${SELECTORS.chatItem}`);
-    if (firstResult) {
-      console.log(`Result found using term: ${term}. Clicking...`);
-      firstResult.click();
-      await sleep(1000);
-
-      // Validate if the chat is open
-      const chatHeader = document.querySelector(SELECTORS.chatHeader);
-      if (chatHeader && chatHeader.textContent.includes(phone)) {
-        console.log('Chat opened successfully.');
-        return { success: true, searchTerm: term };
-      }
-
-      console.warn('Chat header validation failed. Retrying...');
-    } else {
-      console.warn(`No result found for term: ${term}. Retrying with next term.`);
-    }
-  }
+  const termDigits = digitsOnly(term);
+  const termTail = termDigits.slice(-10);
 
   clearEditable(box);
-  console.log('No chat found for any phone search variation.');
-  return { success: false, error: 'Not found in contacts', searchedTerms: termsToTry };
+  await sleep(180);
+  await typeInEditable(box, term, { humanized: true });
+  // Aguardar os resultados de busca aparecerem
+  await sleep(900);
+
+  // Tentar encontrar e clicar no item correto da lista de resultados
+  // O WhatsApp renderiza resultados em elementos listitem ou spans com título/subtítulo
+  const resultSelectors = [
+    'div[role="listitem"]',
+    'div[aria-label][role="row"]',
+    'li[role="listitem"]',
+  ].join(',');
+
+  let clickedItem = null;
+
+  for (let attempt = 0; attempt < 14; attempt++) {
+    const items = Array.from(document.querySelectorAll(resultSelectors));
+    const visibleItems = items.filter(isVisibleElement);
+
+    for (const item of visibleItems) {
+      const itemText = String(item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
+      const itemDigits = digitsOnly(itemText);
+      const ariaLabel = String(item.getAttribute('aria-label') || '').trim();
+      const ariaDigits = digitsOnly(ariaLabel);
+
+      // Verificar match por dígitos (últimos 10 para tolerar DDI variante)
+      const matchesText = termTail && itemDigits && itemDigits.includes(termTail);
+      const matchesAria = termTail && ariaDigits && ariaDigits.includes(termTail);
+      // Fallback: match por nome (quando term não é número)
+      const matchesName = !termDigits && itemText.toLowerCase().includes(term.toLowerCase());
+
+      if (matchesText || matchesAria || matchesName) {
+        console.log('[handleOpenChat] Found matching contact item, clicking:', itemText.slice(0, 60));
+        item.click();
+        clickedItem = item;
+        break;
+      }
+    }
+
+    if (clickedItem) break;
+
+    // Se não encontrou nenhum item correspondente ainda, aguardar mais
+    await sleep(300);
+  }
+
+  if (!clickedItem) {
+    // Fallback: se não encontrou item na lista, tentar Enter (comportamento anterior)
+    console.warn('[handleOpenChat] No matching contact found in list — falling back to Enter key.');
+    box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', which: 13, keyCode: 13, bubbles: true }));
+  }
+
+  await sleep(900);
+
+  // Aguarda a abertura da conversa verificando o message box
+  const msgBox = await getElement(SELECTORS.messageBox, 8000);
+  if (!msgBox) {
+    return { success: false, error: 'Chat open validation failed (message box not found)' };
+  }
+
+  // Validação extra: verificar se o chat aberto é o contato correto pelo número
+  if (termDigits) {
+    const context = extractChatContext('');
+    const contextDigits = digitsOnly(context.phone);
+    if (contextDigits && !isSamePhoneLoose(contextDigits, termDigits)) {
+      console.warn(`[handleOpenChat] Chat opened but phone mismatch: expected ${termDigits}, got ${contextDigits}`);
+      // Não retorna erro — o WhatsApp às vezes só mostra o número após o chat carregar
+      // O caller (handleOpenChatViaAgentBridge) verificará o contato correto se necessário
+    }
+  }
+
+  console.log('Chat opened successfully.');
+  return {
+    success: true,
+    searchTerm: term,
+    clickedItem: !!clickedItem,
+  };
 }
 
 function isVisibleElement(element) {
@@ -1021,13 +1124,56 @@ function isSamePhoneLoose(left, right) {
   return false;
 }
 
+function normalizeName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isLikelyAgentChatContext(context = {}, { agentDigits = '', agentName = '' } = {}) {
+  const contextPhone = digitsOnly(context.phone || '');
+  const contextName = normalizeName(context.name || '');
+  const normalizedAgentName = normalizeName(agentName || '');
+
+  // Strong signal: explicit phone match to the configured agent chat.
+  if (agentDigits && contextPhone && isSamePhoneLoose(contextPhone, agentDigits)) {
+    return true;
+  }
+
+  // Secondary signal: exact same title as the previously opened agent chat (avoid fuzzy includes).
+  if (!contextPhone && normalizedAgentName && contextName && contextName === normalizedAgentName) {
+    return true;
+  }
+
+  return false;
+}
+
+function isLikelyTargetChatContext(context = {}, targetPhone = '') {
+  const targetDigits = digitsOnly(targetPhone);
+  if (!targetDigits) return false;
+
+  const contextPhone = digitsOnly(context.phone || '');
+  if (contextPhone && isSamePhoneLoose(contextPhone, targetDigits)) {
+    return true;
+  }
+
+  const contextNameDigits = digitsOnly(context.name || '');
+  const targetTail = targetDigits.slice(-8);
+  if (targetTail && contextNameDigits && contextNameDigits.includes(targetTail)) {
+    return true;
+  }
+
+  return false;
+}
+
 async function waitForChatPhone(targetPhone, timeoutMs = 10000) {
   const startedAt = Date.now();
   const timeout = Math.max(1000, Number(timeoutMs) || 10000);
+  const targetDigits = digitsOnly(targetPhone);
+
+  if (!targetDigits) return false;
 
   while ((Date.now() - startedAt) < timeout) {
-    const context = extractChatContext(targetPhone);
-    if (isSamePhoneLoose(context.phone, targetPhone)) {
+    const context = extractChatContext('');
+    if (context.phoneSource !== 'fallback' && isSamePhoneLoose(context.phone, targetDigits)) {
       return true;
     }
 
@@ -1035,6 +1181,48 @@ async function waitForChatPhone(targetPhone, timeoutMs = 10000) {
   }
 
   return false;
+}
+
+function clickElementCenterLeft(element) {
+  if (!element || !isVisibleElement(element)) {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect();
+  if (!rect || rect.width <= 0 || rect.height <= 0) {
+    return false;
+  }
+
+  const clientX = rect.left + (rect.width / 2);
+  const clientY = rect.top + (rect.height / 2);
+  const target = document.elementFromPoint(clientX, clientY) || element;
+
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    button: 0,
+    buttons: 1,
+    clientX,
+    clientY,
+  };
+
+  try {
+    target.dispatchEvent(new MouseEvent('mousemove', eventInit));
+    target.dispatchEvent(new MouseEvent('mouseover', eventInit));
+    target.dispatchEvent(new MouseEvent('mouseenter', eventInit));
+    target.dispatchEvent(new MouseEvent('mousedown', eventInit));
+    target.dispatchEvent(new MouseEvent('mouseup', eventInit));
+    target.dispatchEvent(new MouseEvent('click', eventInit));
+    return true;
+  } catch (error) {
+    try {
+      element.click();
+      return true;
+    } catch (clickError) {
+      return false;
+    }
+  }
 }
 
 function getNodeCompactText(node) {
@@ -1049,10 +1237,14 @@ function pickPhoneClickTarget(messageNode, targetPhone) {
 
   const targetDigits = digitsOnly(targetPhone);
   if (!targetDigits) return null;
+  const targetTail = targetDigits.slice(-8);
+  if (!targetTail) return null;
 
   const candidates = Array.from(messageNode.querySelectorAll(
-    'a[href], span[role="link"], div[role="link"], span.selectable-text, div.selectable-text',
+    'a[href], span[role="link"], div[role="link"], span.selectable-text, div.selectable-text, span, div',
   ));
+  let bestCandidate = null;
+  let bestScore = -1;
 
   for (const candidate of candidates) {
     if (!isVisibleElement(candidate)) continue;
@@ -1062,18 +1254,41 @@ function pickPhoneClickTarget(messageNode, targetPhone) {
     const mergedDigits = digitsOnly(`${text} ${href}`);
     if (!mergedDigits) continue;
 
-    const targetTail = targetDigits.slice(-8);
     const candidateTail = mergedDigits.slice(-8);
-    if (!targetTail || !candidateTail) continue;
+    if (!candidateTail) continue;
 
-    if (mergedDigits.includes(targetDigits) || targetDigits.includes(mergedDigits) || candidateTail === targetTail) {
-      return candidate;
+    const matchesTarget = (
+      mergedDigits.includes(targetDigits)
+      || targetDigits.includes(mergedDigits)
+      || candidateTail === targetTail
+    );
+    if (!matchesTarget) continue;
+
+    let score = 0;
+    if (candidate.matches('a[href]')) score += 5;
+    if (candidate.matches('[role="link"]')) score += 4;
+    if (candidate.matches('.selectable-text')) score += 3;
+    if (href && digitsOnly(href).includes(targetTail)) score += 4;
+    if (digitsOnly(text).includes(targetTail)) score += 2;
+
+    const rect = candidate.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0 && (rect.width * rect.height) < 22000) {
+      score += 1;
     }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestCandidate = candidate;
+    }
+  }
+
+  if (bestCandidate) {
+    return bestCandidate;
   }
 
   if (isVisibleElement(messageNode)) {
     const compact = getNodeCompactText(messageNode);
-    if (digitsOnly(compact).includes(targetDigits.slice(-8))) {
+    if (digitsOnly(compact).includes(targetTail)) {
       return messageNode;
     }
   }
@@ -1088,10 +1303,15 @@ async function clickConversationWithNumberOption(targetPhone, timeoutMs = 9000) 
   const targetTail = targetDigits.slice(-8);
   const dialogSelectors = [
     'div[role="button"]',
+    'span[role="button"]',
     'button',
     'div[role="menuitem"]',
     'li[role="menuitem"]',
     'li[role="button"]',
+    'div[role="option"]',
+    'span[role="option"]',
+    'div[tabindex="0"]',
+    'span[tabindex="0"]',
   ].join(',');
 
   while ((Date.now() - startedAt) < timeout) {
@@ -1113,9 +1333,12 @@ async function clickConversationWithNumberOption(targetPhone, timeoutMs = 9000) 
       const labelTail = labelDigits.slice(-8);
       const hasConversationIntent = (
         normalized.includes('conversar com')
+        || normalized.includes('conversa com')
+        || normalized.includes('converse com')
         || normalized.includes('chat with')
         || normalized.includes('message +')
         || normalized.includes('mensagem para')
+        || normalized.includes('enviar mensagem para')
         || normalized.includes('abrir conversa')
       );
 
@@ -1130,7 +1353,8 @@ async function clickConversationWithNumberOption(targetPhone, timeoutMs = 9000) 
 
       if (!seemsTarget) continue;
 
-      candidate.click();
+      const clicked = clickElementCenterLeft(candidate);
+      if (!clicked) continue;
       await sleep(450);
       const chatOpened = await waitForChatPhone(targetDigits, 7000);
       if (chatOpened) {
@@ -1167,7 +1391,11 @@ async function clickRecentPhoneFromSelfChat(targetPhone, timeoutMs = 10000) {
       const clickTarget = pickPhoneClickTarget(node, targetDigits);
       if (!clickTarget) continue;
 
-      clickTarget.click();
+      const clicked = clickElementCenterLeft(clickTarget);
+      if (!clicked) {
+        continue;
+      }
+
       await sleep(420);
 
       const openedDirectly = await waitForChatPhone(targetDigits, 4500);
@@ -1218,6 +1446,11 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
   }
 
   await sleep(550);
+  const openedAgentContext = extractChatContext('');
+  const agentContextRef = {
+    agentDigits,
+    agentName: String(openedAgentContext?.name || '').trim(),
+  };
 
   const bridgeMessage = `+${targetDigits}`;
   const bridgeSendResult = await handleClickSend(bridgeMessage, { humanized: shouldHumanize, paste: true });
@@ -1243,20 +1476,47 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
   if (!clickPhoneResult.openedDirectly) {
     const chooseConversationResult = await clickConversationWithNumberOption(targetDigits, 9000);
     if (!chooseConversationResult?.success) {
-      return {
-        success: false,
-        error: chooseConversationResult?.error || 'Failed to choose "Conversar com numero".',
-        step: 'choose_conversation_option',
-      };
+      // WA can open the target chat directly after clicking the phone message, without
+      // rendering the context menu option. If composer is ready and we're no longer in
+      // the agent chat, continue instead of failing.
+      const fallbackComposer = await waitForMessageComposer(2200);
+      const fallbackContext = extractChatContext('');
+      const movedToTarget = isLikelyTargetChatContext(fallbackContext, targetDigits);
+      const stillOnAgentFallback = isLikelyAgentChatContext(fallbackContext, agentContextRef);
+
+      if (!(fallbackComposer && (movedToTarget || !stillOnAgentFallback))) {
+        return {
+          success: false,
+          error: chooseConversationResult?.error || 'Failed to choose "Conversar com numero".',
+          step: 'choose_conversation_option',
+        };
+      }
     }
   }
 
   const chatReady = await waitForChatPhone(targetDigits, 12000);
-  if (!chatReady) {
+  const composerReady = await waitForMessageComposer(12000);
+  const finalContext = extractChatContext('');
+  const stillAgentChat = isLikelyAgentChatContext(finalContext, agentContextRef);
+
+  if (!composerReady || stillAgentChat) {
     return {
       success: false,
-      error: 'Bridge flow finished but target chat did not open.',
-      step: 'wait_target_chat',
+      error: stillAgentChat
+        ? 'Bridge flow stayed in agent chat after clicking target.'
+        : 'Message composer not ready after opening target chat.',
+      step: stillAgentChat ? 'wait_target_chat' : 'wait_target_composer',
+    };
+  }
+
+  if (!chatReady) {
+    // Some WA variants don't expose the target phone in URL/title immediately.
+    // If composer is ready and we're not in the agent chat anymore, proceed.
+    return {
+      success: true,
+      agentPhone: agentDigits,
+      targetPhone: targetDigits,
+      inferredTargetChat: true,
     };
   }
 
@@ -1271,32 +1531,59 @@ async function handleClickSend(message, options = {}) {
   console.log('Attempting to find Send button...');
   const shouldHumanize = options.humanized !== false;
   const shouldPaste = Boolean(options.paste);
+  let msgBox = null;
 
   if (message) {
-    const msgBox = await getElement(SELECTORS.messageBox);
+    msgBox = await waitForMessageComposer(12000);
     if (msgBox) {
       msgBox.focus();
       if (shouldPaste) {
-        // Insert everything at once (useful for bridge numbers).
+        clearEditable(msgBox);
         document.execCommand('insertText', false, String(message));
         await sleep(shouldHumanize ? (Math.random() * 240 + 180) : 120);
       } else {
-        await typeInEditable(msgBox, message, { humanized: shouldHumanize });
+        const typeResult = await typeInEditable(msgBox, message, { humanized: shouldHumanize });
         await sleep(shouldHumanize ? (Math.random() * 700 + 300) : 500);
+        if (!typeResult || typeResult.success !== true) {
+          return { success: false, error: typeResult.error || 'Text insertion failed' };
+        }
+      }
+
+      const expectedText = normalizeEditableText(message);
+      const currentText = normalizeEditableText(msgBox.textContent || '');
+      if (expectedText && !currentText.includes(expectedText)) {
+        return { success: false, error: 'Message text not present in composer' };
       }
     } else {
       return { success: false, error: 'Message box not found' };
     }
   }
 
-  const sendBtn = await getElement(SELECTORS.sendButton, 5000);
+  const sendBtn = await getElement(SELECTORS.sendButton, 9000);
 
-  if (sendBtn) {
+  if (sendBtn && isVisibleElement(sendBtn)) {
     console.log('Send button found. Clicking...');
     await sleep(shouldHumanize ? (Math.random() * 650 + 260) : (Math.random() * 500 + 200));
-    sendBtn.click();
+    const clicked = clickElementCenterLeft(sendBtn);
+    if (!clicked) {
+      return { success: false, error: 'Failed to click send button' };
+    }
     await sleep(2000);
     return { success: true };
+  }
+
+  // Fallback: if message is already in composer and the send button did not render yet, press Enter.
+  if (message && msgBox) {
+    msgBox.focus();
+    msgBox.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter',
+      code: 'Enter',
+      which: 13,
+      keyCode: 13,
+      bubbles: true,
+    }));
+    await sleep(1400);
+    return { success: true, fallback: 'enter' };
   }
 
   const invalidModal = document.querySelector(SELECTORS.invalidNumber);
@@ -1321,7 +1608,7 @@ async function handlePasteMedia(media) {
       await navigator.clipboard.write([item]);
       console.log('Image copied to clipboard.');
 
-      const msgBox = await getElement(SELECTORS.messageBox);
+      const msgBox = await waitForMessageComposer(10000);
       if (msgBox) {
         msgBox.focus();
         document.execCommand('paste');
@@ -1366,6 +1653,18 @@ async function handleFocusChatTool(tool) {
 
 initContentGlassUi();
 
+// Serialize DOM automation actions so concurrent background triggers don't interleave typing/clicking.
+let waActionChain = Promise.resolve();
+function enqueueWhatsAppAction(actionName, actionFn) {
+  const run = waActionChain.then(actionFn, actionFn);
+  waActionChain = run.catch(() => {});
+
+  return run.catch((error) => ({
+    success: false,
+    error: error?.message || `${actionName} failed`,
+  }));
+}
+
 // Receive Messages from Background
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'PING') {
@@ -1389,21 +1688,28 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'OPEN_CHAT_VIA_AGENT_BRIDGE') {
-    handleOpenChatViaAgentBridge(request.agentPhone, request.targetPhone, {
-      humanized: request.humanized !== false,
-      agentSearchTerms: request.agentSearchTerms || [],
-      agentQuery: request.agentQuery || '',
-    }).then(sendResponse);
+    enqueueWhatsAppAction('OPEN_CHAT_VIA_AGENT_BRIDGE', () => handleOpenChatViaAgentBridge(
+      request.agentPhone,
+      request.targetPhone,
+      {
+        humanized: request.humanized !== false,
+        agentSearchTerms: request.agentSearchTerms || [],
+        agentQuery: request.agentQuery || '',
+      },
+    )).then(sendResponse);
     return true;
   }
 
   if (request.action === 'PASTE_MEDIA') {
-    handlePasteMedia(request.media).then(sendResponse);
+    enqueueWhatsAppAction('PASTE_MEDIA', () => handlePasteMedia(request.media)).then(sendResponse);
     return true;
   }
 
   if (request.action === 'CLICK_SEND') {
-    handleClickSend(request.message, { humanized: request.humanized }).then(sendResponse);
+    enqueueWhatsAppAction('CLICK_SEND', () => handleClickSend(
+      request.message,
+      { humanized: request.humanized, paste: request.paste },
+    )).then(sendResponse);
     return true;
   }
 
@@ -1413,22 +1719,44 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.action === 'GET_ACTIVE_CHAT_CONTEXT') {
+    const targetPhone = digitsOnly(request.phone || '');
+    const context = extractChatContext('');
+    const composer = document.querySelector(SELECTORS.messageBox);
+    const composerReady = Boolean(composer && isVisibleElement(composer) && composer.isContentEditable);
+
+    sendResponse({
+      success: true,
+      phone: digitsOnly(context.phone || ''),
+      name: String(context.name || ''),
+      phoneSource: context.phoneSource || 'unknown',
+      composerReady,
+      matchesTarget: targetPhone ? isSamePhoneLoose(context.phone, targetPhone) : false,
+    });
+    return true;
+  }
+
   if (request.action === 'CAPTURE_CHAT_HISTORY') {
-    captureChatHistory(request.phone, {
-      limit: request.limit,
-      preloadOlder: request.preloadOlder !== false,
-      maxScrollIterations: request.maxScrollIterations,
-    })
-      .then((snapshot) => sendResponse({ success: true, ...snapshot }))
-      .catch((error) => sendResponse({
-        success: false,
-        error: error?.message || 'Failed to capture chat history.',
-      }));
+    enqueueWhatsAppAction('CAPTURE_CHAT_HISTORY', async () => {
+      try {
+        const snapshot = await captureChatHistory(request.phone, {
+          limit: request.limit,
+          preloadOlder: request.preloadOlder !== false,
+          maxScrollIterations: request.maxScrollIterations,
+        });
+        return { success: true, ...snapshot };
+      } catch (error) {
+        return {
+          success: false,
+          error: error?.message || 'Failed to capture chat history.',
+        };
+      }
+    }).then(sendResponse);
     return true;
   }
 
   if (request.action === 'FOCUS_CHAT_TOOL') {
-    handleFocusChatTool(request.tool).then(sendResponse);
+    enqueueWhatsAppAction('FOCUS_CHAT_TOOL', () => handleFocusChatTool(request.tool)).then(sendResponse);
     return true;
   }
 });

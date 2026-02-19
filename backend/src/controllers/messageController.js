@@ -4,6 +4,7 @@ const ConversationAssignment = require('../models/ConversationAssignment');
 const { normalizePhone } = require('../utils/phone');
 const { buildServerErrorResponse } = require('../utils/httpError');
 const { emitRealtimeEvent } = require('../realtime/realtime');
+const { logSendResult } = require('../monitorSendFlow');
 
 function appendAudit(message, action, details, meta = {}) {
     if (!Array.isArray(message.audit)) {
@@ -904,8 +905,20 @@ exports.registerInboundMessage = async (req, res) => {
             duplicate: false,
             message: createdMessage,
         });
+        logSendResult({
+            jobId: createdMessage?._id,
+            status: 'sent',
+            error: null,
+            extra: { source, phone: normalizedPhone, campaignId: relatedCampaignId }
+        });
     } catch (err) {
         console.error(err.message);
+        logSendResult({
+            jobId: null,
+            status: 'failed',
+            error: err,
+            extra: { source: req.body?.source, phone: req.body?.phone, campaignId: req.body?.campaignId }
+        });
         const errorResponse = buildServerErrorResponse(err);
         res.status(errorResponse.statusCode).json(errorResponse.body);
     }
@@ -1029,6 +1042,7 @@ exports.getNextJob = async (req, res) => {
         // Step 1: Get active campaign IDs
         const activeCampaigns = await Campaign.find({ status: 'running' }).select('_id');
         const activeCampaignIds = activeCampaigns.map((c) => c._id);
+        const activeCampaignIdSet = new Set(activeCampaignIds.map((id) => String(id)));
 
         if (activeCampaignIds.length === 0) {
             return res.json({ job: null });
@@ -1037,11 +1051,12 @@ exports.getNextJob = async (req, res) => {
         let eligibleCampaignIds = activeCampaignIds;
 
         if (requestedCampaignId) {
-            if (!activeCampaignIds.includes(requestedCampaignId)) {
+            const requestedId = String(requestedCampaignId);
+            if (!activeCampaignIdSet.has(requestedId)) {
                 return res.json({ job: null });
             }
 
-            eligibleCampaignIds = [requestedCampaignId];
+            eligibleCampaignIds = [requestedId];
         }
 
         // Safety: if a worker crashes after reserving a job, it can get stuck forever in "processing".
@@ -1185,7 +1200,14 @@ exports.updateJobStatus = async (req, res) => {
             error: error || null,
         });
 
+
         await message.save();
+        logSendResult({
+            jobId: message._id,
+            status: message.status,
+            error: message.error,
+            extra: { previousStatus, phone: message.phone, campaignId: message.campaign }
+        });
         emitRealtimeEvent('messages.status.updated', {
             messageId: message._id,
             campaignId: message.campaign || null,

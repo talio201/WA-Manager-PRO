@@ -21,6 +21,10 @@ app.get('/', (req, res) => res.json({ msg: 'WhatsApp Campaign Manager API Runnin
 // Static folder for uploads
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
+// Monitoramento do fluxo de envio
+const { sendFlowLogger } = require('./monitorSendFlow');
+app.use('/api/messages', sendFlowLogger);
+
 // Routes
 app.use('/api/campaigns', require('./routes/campaignRoutes'));
 app.use('/api/messages', require('./routes/messageRoutes'));
@@ -38,7 +42,9 @@ app.use((err, req, res, next) => {
     return next(err);
 });
 
-const PORT = process.env.PORT || 5000;
+// NOTE: some environments may already bind to 5000, causing confusing 403s when the extension hits the wrong process.
+// Default to 3000 (can be overridden via PORT in backend/.env).
+const PORT = process.env.PORT || 3000;
 
 const server = http.createServer(app);
 initRealtimeServer(server);

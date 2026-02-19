@@ -1,7 +1,7 @@
 ﻿// Configs
-const API_URL = 'http://localhost:5000/api';
+const API_URL = 'http://localhost:3000/api';
 const IDLE_POLLING_INTERVAL_MS = 10000; // Polling when queue is empty
-const REALTIME_WS_URL = 'ws://localhost:5000/ws';
+const REALTIME_WS_URL = 'ws://localhost:3000/ws';
 const REALTIME_RECONNECT_BASE_MS = 1200;
 const QUEUE_ALARM_NAME = 'wa-manager-queue-next-run';
 const DEFAULT_DELAY_RANGE = {
@@ -653,6 +653,17 @@ function digitsOnly(value) {
     return String(value || '').replace(/\D/g, '');
 }
 
+function isSamePhoneLoose(left, right) {
+    const leftDigits = digitsOnly(left);
+    const rightDigits = digitsOnly(right);
+    if (!leftDigits || !rightDigits) return false;
+    if (leftDigits === rightDigits) return true;
+
+    const leftTail = leftDigits.slice(-10);
+    const rightTail = rightDigits.slice(-10);
+    return Boolean(leftTail && rightTail && leftTail === rightTail);
+}
+
 function extractCampaignId(jobCampaign) {
     if (!jobCampaign) return null;
     return typeof jobCampaign === 'string' ? jobCampaign : jobCampaign._id || null;
@@ -737,6 +748,8 @@ async function openChatForCampaignJob(tab, job) {
         return { success: false, error: 'Invalid campaign phone.' };
     }
 
+    await refreshSettingsFromStorage().catch(() => {});
+
     const bridgePhone = digitsOnly(extensionSettings.agentBridgePhone);
     const bridgeChatQuery = String(extensionSettings.agentBridgeChatQuery || '').trim();
     if (!bridgePhone && !bridgeChatQuery) {
@@ -753,6 +766,29 @@ async function openChatForCampaignJob(tab, job) {
             transient: true,
             error: 'WhatsApp ainda carregando. Tente novamente em instantes.',
         };
+    }
+
+    // If the same target chat is already focused and ready, avoid re-running the full bridge flow.
+    if (lastResolvedChat?.tabId === tab.id && isSamePhoneLoose(lastResolvedChat.phone, targetPhone)) {
+        try {
+            const activeContext = await sendMessageToTabWithRetry(tab.id, {
+                action: 'GET_ACTIVE_CHAT_CONTEXT',
+                phone: targetPhone,
+            }, 2, 220);
+
+            if (activeContext?.success && activeContext?.composerReady) {
+                const activePhone = digitsOnly(activeContext.phone || '');
+                if (activeContext.matchesTarget || !activePhone) {
+                    return {
+                        success: true,
+                        targetPhone,
+                        strategy: 'cached_chat',
+                    };
+                }
+            }
+        } catch (error) {
+            // Ignore and continue with bridge flow.
+        }
     }
 
     try {
@@ -1158,40 +1194,69 @@ async function processQueue() {
         const navigation = await openChatForCampaignJob(tab, job);
         if (!navigation?.success) {
             const navigationError = String(navigation?.error || '').trim();
-
-            if (navigation?.transient) {
-                nextDelayMs = 4000;
-                nextRunScheduleReason = 'transient_wait';
-                // WhatsApp/content script still loading: release job back to the queue.
-                await updateJobStatus(job._id, 'pending');
-                reservedJob = null;
-                pushGlassToast({
-                    title: 'Aguardando WhatsApp',
-                    message: navigationError || 'WhatsApp ainda inicializando.',
-                    tone: 'warning',
-                });
-                return;
-            }
+            const normalizedNavigationError = navigationError.toLowerCase();
+            const attemptCount = Math.max(1, Number(job?.attemptCount) || 1);
+            const maxBridgeRetries = 3;
 
             const isBridgeConfigurationIssue = (
-                navigationError.includes('Configure o chat do agente')
-                || navigationError.includes('Configure o numero do agente')
-                || navigationError.includes('Not found in contacts')
-                || navigationError.includes('Search box not found')
+                normalizedNavigationError.includes('configure o chat do agente')
+                || normalizedNavigationError.includes('configure o numero do agente')
+                || normalizedNavigationError.includes('agent bridge chat is required')
+            );
+
+            const isBridgeTransientIssue = (
+                Boolean(navigation?.transient)
+                || normalizedNavigationError.includes('search box not found')
+                || normalizedNavigationError.includes('not found in contacts')
+                || normalizedNavigationError.includes('no search term available')
+                || normalizedNavigationError.includes('chat open validation failed')
+                || normalizedNavigationError.includes('could not find sent number message')
+                || normalizedNavigationError.includes('could not click phone in self chat message')
+                || normalizedNavigationError.includes('could not find "conversar com" option')
+                || normalizedNavigationError.includes('conversation option not found')
+                || normalizedNavigationError.includes('did not enter new chat')
+                || normalizedNavigationError.includes('bridge flow stayed in agent chat')
+                || normalizedNavigationError.includes('message composer not ready')
+                || normalizedNavigationError.includes('message box not found')
+                || normalizedNavigationError.includes('send button not found')
             );
 
             if (isBridgeConfigurationIssue) {
-                // This is not a per-message failure; pause the queue so the user can fix the bridge settings
-                // instead of marking the entire campaign as failed.
-                await updateJobStatus(job._id, 'pending');
+                // Do not auto-pause the queue on configuration issues. Mark this job as failed
+                // and keep the worker active for subsequent jobs/campaigns.
+                await updateJobStatus(job._id, 'failed', navigationError || 'Falha de configuracao do bridge.');
                 reservedJob = null;
                 lastResolvedChat = null;
-
-                stopQueue();
                 pushGlassToast({
                     title: 'Envio bloqueado',
                     message: navigationError || 'Nao foi possivel abrir o chat do agente (bridge).',
                     tone: 'error',
+                });
+                return;
+            }
+
+            if (isBridgeTransientIssue) {
+                if (attemptCount >= maxBridgeRetries) {
+                    await updateJobStatus(job._id, 'failed', navigationError || 'Falha transiente no fluxo bridge.');
+                    reservedJob = null;
+                    lastResolvedChat = null;
+                    pushGlassToast({
+                        title: 'Falha no bridge',
+                        message: navigationError || 'Nao foi possivel abrir o chat de destino apos varias tentativas.',
+                        tone: 'error',
+                    });
+                    return;
+                }
+
+                nextDelayMs = 4000;
+                nextRunScheduleReason = 'bridge_retry';
+                await updateJobStatus(job._id, 'pending', navigationError || 'Bridge transient retry');
+                reservedJob = null;
+                lastResolvedChat = null;
+                pushGlassToast({
+                    title: 'Retentando envio',
+                    message: navigationError || 'Falha temporaria ao abrir conversa. Nova tentativa em instantes.',
+                    tone: 'warning',
                 });
                 return;
             }
@@ -1233,11 +1298,50 @@ async function processQueue() {
                 action: 'CLICK_SEND',
                 message: messageToType,
                 humanized: Boolean(extensionSettings.enableHumanizedTyping),
+                paste: true,
                 source: 'queue_campaign',
             }, 3, 450);
 
             const status = result && result.success ? 'sent' : 'failed';
             const errorMessage = result && result.error ? result.error : null;
+            const attemptCount = Math.max(1, Number(job?.attemptCount) || 1);
+            const maxSendRetries = 3;
+
+            const normalizedSendError = String(errorMessage || '').toLowerCase();
+            const isTransientSendError = (
+                normalizedSendError.includes('message box not found')
+                || normalizedSendError.includes('message composer not ready')
+                || normalizedSendError.includes('send button not found')
+                || normalizedSendError.includes('failed to click send button')
+                || normalizedSendError.includes('text insertion failed')
+                || normalizedSendError.includes('message text not present in composer')
+            );
+
+            if (status === 'failed' && isTransientSendError) {
+                if (attemptCount >= maxSendRetries) {
+                    await updateJobStatus(job._id, 'failed', errorMessage || 'Falha transiente de envio apos varias tentativas.');
+                    reservedJob = null;
+                    lastResolvedChat = null;
+                    pushGlassToast({
+                        title: 'Falha no envio',
+                        message: errorMessage || `Nao foi possivel enviar para ${job.phone} apos varias tentativas.`,
+                        tone: 'error',
+                    });
+                    return;
+                }
+
+                nextDelayMs = 3200;
+                nextRunScheduleReason = 'send_retry';
+                await updateJobStatus(job._id, 'pending', errorMessage || 'Transient send retry');
+                reservedJob = null;
+                pushGlassToast({
+                    title: 'Retentando envio',
+                    message: errorMessage || `Falha temporaria ao enviar para ${job.phone}.`,
+                    tone: 'warning',
+                });
+                return;
+            }
+
             await updateJobStatus(job._id, status, errorMessage);
             reservedJob = null;
 

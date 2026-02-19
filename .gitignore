@@ -19,5 +19,11 @@ backend/.env
 backend/.env.*
 !backend/.env.example
 
+# macOS
+.DS_Store
+
+# Local debug logs
+send_flow.log
+
 extension/.git
 extension/.git_nested_backup

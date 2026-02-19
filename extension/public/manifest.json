@@ -12,7 +12,8 @@
     ],
     "host_permissions": [
         "*://web.whatsapp.com/*",
-        "http://localhost:5000/*"
+        "http://localhost/*",
+        "http://127.0.0.1/*"
     ],
     "background": {
         "service_worker": "src/background/index.js",

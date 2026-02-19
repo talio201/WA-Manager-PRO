@@ -1,4 +1,4 @@
-const DEFAULT_WS_URL = 'ws://localhost:5000/ws';
+const DEFAULT_WS_URL = 'ws://localhost:3000/ws';
 
 function safeParseMessage(raw) {
     try {
@@ -108,4 +108,3 @@ export function connectRealtime({
         }
     };
 }
-
