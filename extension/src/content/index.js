@@ -1128,48 +1128,6 @@ function normalizeName(value) {
   return String(value || '').trim().toLowerCase();
 }
 
-function isExpectedAgentChatContext(context = {}, options = {}) {
-  const agentDigits = digitsOnly(options.agentDigits || '');
-  const agentQuery = String(options.agentQuery || '').trim();
-  const contextPhone = digitsOnly(context.phone || '');
-  const contextName = String(context.name || '').trim();
-  const contextNameDigits = digitsOnly(contextName);
-  const normalizedName = normalizeName(contextName);
-  const normalizedQuery = normalizeName(agentQuery);
-  const queryDigits = digitsOnly(agentQuery);
-
-  let phoneMatch = false;
-  let queryMatch = false;
-
-  if (agentDigits) {
-    phoneMatch = (
-      (contextPhone && isSamePhoneLoose(contextPhone, agentDigits))
-      || (contextNameDigits && isSamePhoneLoose(contextNameDigits, agentDigits))
-    );
-  }
-
-  if (normalizedQuery) {
-    queryMatch = normalizedName.includes(normalizedQuery);
-  }
-  if (queryDigits) {
-    const queryTail = queryDigits.slice(-8);
-    queryMatch = queryMatch || Boolean(
-      (contextPhone && isSamePhoneLoose(contextPhone, queryDigits))
-      || (contextNameDigits && (
-        contextNameDigits.includes(queryDigits)
-        || (queryTail && contextNameDigits.includes(queryTail))
-      ))
-    );
-  }
-
-  if (agentDigits && normalizedQuery) {
-    return phoneMatch || queryMatch;
-  }
-  if (agentDigits) return phoneMatch;
-  if (normalizedQuery || queryDigits) return queryMatch;
-  return false;
-}
-
 function isLikelyAgentChatContext(context = {}, { agentDigits = '', agentName = '' } = {}) {
   const contextPhone = digitsOnly(context.phone || '');
   const contextName = normalizeName(context.name || '');
@@ -1492,17 +1450,6 @@ async function handleOpenChatViaAgentBridge(agentPhone, targetPhone, options = {
 
   await sleep(550);
   const openedAgentContext = extractChatContext('');
-  const agentChatIsValid = isExpectedAgentChatContext(openedAgentContext, {
-    agentDigits,
-    agentQuery,
-  });
-  if (!agentChatIsValid) {
-    return {
-      success: false,
-      error: 'Agent bridge chat mismatch before sending number.',
-      step: 'open_agent_chat',
-    };
-  }
   const agentContextRef = {
     agentDigits,
     agentName: String(openedAgentContext?.name || '').trim(),
